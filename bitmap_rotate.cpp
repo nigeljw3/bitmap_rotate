@@ -28,6 +28,9 @@
 #include <cassert>
 #include <algorithm>
 #include <cstring>
+#include <smmintrin.h>
+#include <immintrin.h>
+#include <xmmintrin.h>
 
 // Using purely for convenience as only the standard library is included
 using namespace std;
@@ -37,8 +40,18 @@ const uint32_t cacheline_size = 64;
 
 // Prototypes
 void rotate_bitmap_bilinear(const uint8_t* bitmap, const uint32_t width, const uint32_t height, const float dx, const float dy, uint8_t* output, const bool interchange);
+void rotate_bitmap_bilinear_simd(const uint8_t* bitmap, const uint32_t width, const uint32_t height, const float dx, const float dy, uint8_t* output, const bool interchange);
 bool load_bitmap(const char* filename, uint8_t*& bitmap, uint32_t& width, uint32_t& height, uint32_t& max_val);
 void generate_bitmap(const uint8_t* bitmap, const uint32_t& width, const uint32_t& height, const uint32_t& max_val, const bool interchange);
+
+inline __m256 fblerp(const __m256 x1, const __m256 x2, const __m256 y1, const __m256 y2, const __m256 dx, const __m256 dy) {
+    __m256 m1 = _mm256_sub_ps(x2, x1);
+    m1 = _mm256_fmadd_ps(m1, dx, x1);
+    __m256 m2 = _mm256_sub_ps(y2, y1);
+    m2 = _mm256_fmadd_ps(m2, dx, y1);
+    m1 = _mm256_sub_ps(m1, m2);
+    return _mm256_fmadd_ps(m1, dy, m2);
+}
 
 // Implementation
 
@@ -133,6 +146,152 @@ void generate_bitmap(const uint8_t* bitmap, const uint32_t& width, const uint32_
     }
 }
 
+void rotate_bitmap_bilinear_simd(const uint8_t* bitmap, const uint32_t width, const uint32_t height, const float dx, const float dy, uint8_t* output, const bool interchange) {
+    const uint32_t tile_size = cacheline_size;
+    const uint32_t origin_x = width >> 1;
+    const uint32_t origin_y = height >> 1;
+    uint32_t columns;
+    uint32_t rows;
+    const float delta = 1.f - dy;
+    float init_x = origin_x*delta - origin_y*dx;
+    float init_y = origin_y*delta + origin_x*dx;
+    init_x = (init_x > width - 1) ? width - 1 : init_x;
+    init_y = (init_y > height - 1) ? height - 1 : init_y;
+
+    if (interchange) {
+        columns = height;
+        rows = width;
+    }else {
+        columns = width;
+        rows = height;
+    }
+    
+    const __m256 m_init = _mm256_setr_ps(0.f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f);
+    const __m256i mask8bit = _mm256_set1_epi32(0xff);
+    const __m256 m_one = _mm256_set1_ps(1);
+    const __m256 m_zero = _mm256_setzero_ps();
+    const __m256 m_height = _mm256_set1_ps(height);
+    const __m256 m_width = _mm256_set1_ps(width);
+    const __m256 m_ceils_x = _mm256_set1_ps(columns - 1);
+    const __m256 m_ceils_y = _mm256_set1_ps(rows - 1);
+    const __m256i m_columnsi = _mm256_set1_epi32(static_cast<int32_t>(columns));
+    const __m256 m_dx1 = _mm256_set1_ps(dy); 
+    const __m256 m_dy1 = _mm256_set1_ps(dx); 
+
+    for (uint32_t i = 0; i < width; i += tile_size) {
+        for (uint32_t j = 0; j < height; j += tile_size) {
+            for (uint32_t k = i; k < i + tile_size; ++k) {
+                const uint64_t row = k*width;
+                const float start_x = init_x + k*dx;
+                const float start_y = init_y + k*dy;
+                const uint32_t offset = sizeof(__m256)/sizeof(float);
+
+                for (uint32_t l = j; l < j + tile_size; l += offset) {
+                    float x = start_x + l*dy;
+                    float y = start_y - l*dx;
+                    
+                    __m256 m_startx = _mm256_set1_ps(x); 
+                    __m256 m_starty = _mm256_set1_ps(y); 
+                    __m256 m_x1, m_y1;
+
+                    // Interchange the array accesses if they are orthogonal to the memory layout
+                    if (interchange) {
+                        m_y1 = _mm256_fmadd_ps(m_init, m_dx1, m_startx);
+                        m_x1 = _mm256_fnmadd_ps(m_init, m_dy1, m_starty);
+                    }else {
+                        m_x1 = _mm256_fmadd_ps(m_init, m_dx1, m_startx);
+                        m_y1 = _mm256_fnmadd_ps(m_init, m_dy1, m_starty);
+                    }
+
+                    // Clamp values to min and max range of width and height
+                    m_x1 = _mm256_min_ps(m_x1, m_width);
+                    m_x1 = _mm256_max_ps(m_x1, m_zero);
+                    m_y1 = _mm256_min_ps(m_y1, m_height);
+                    m_y1 = _mm256_max_ps(m_y1, m_zero);
+                    
+                    // Floor to get the lower image offset coordinates
+                    __m256 m_x_floor = _mm256_floor_ps(m_x1);
+                    __m256 m_y_floor = _mm256_floor_ps(m_y1);
+                    
+                    // Find the delta values for the blerp operation
+                    __m256 m_dx = _mm256_sub_ps(m_x1, m_x_floor);
+                    __m256 m_dy = _mm256_sub_ps(m_y1, m_y_floor);
+                    
+                    // Either increment the floored value or adjust the
+                    // tiled offset to the start of the next cacheline
+                    __m256 mask = _mm256_cmp_ps(m_x1, m_ceils_x, _CMP_LT_OS);
+                    __m256 m_x_ceiling = _mm256_and_ps(mask, m_one);
+                    m_x_ceiling = _mm256_add_ps(m_x1, m_x_ceiling);
+                    
+                    mask = _mm256_cmp_ps(m_y1, m_ceils_y, _CMP_LT_OS);
+                    __m256 m_y_ceiling = _mm256_and_ps(mask, m_one);
+                    m_y_ceiling = _mm256_add_ps(m_y1, m_y_ceiling);
+
+                    m_x_floor = _mm256_floor_ps(m_x_floor);
+                    m_x_ceiling = _mm256_floor_ps(m_x_ceiling);
+                    m_y_floor = _mm256_floor_ps(m_y_floor);
+                    m_y_ceiling = _mm256_floor_ps(m_y_ceiling);
+                    
+                    // Convert the rotated index values into 32 bit integers
+                    __m256i m_x1i =_mm256_cvtps_epi32(m_x_floor);
+                    __m256i m_x2i =_mm256_cvtps_epi32(m_x_ceiling);
+                    __m256i m_y1i =_mm256_cvtps_epi32(m_y_floor);
+                    __m256i m_y2i =_mm256_cvtps_epi32(m_y_ceiling);
+
+                    // Calculate the memory offsets for the tiled memory accesses
+                    // Sadly there isn't a madd avx instruction for 32 bit integers
+                    __m256i m_intermediate = _mm256_mullo_epi32(m_y2i, m_columnsi);
+                    __m256i m_index1 = _mm256_add_epi32(m_intermediate, m_x1i);
+                    __m256i m_index2 = _mm256_add_epi32(m_intermediate, m_x2i);
+                    m_intermediate = _mm256_mullo_epi32(m_y1i, m_columnsi);
+                    __m256i m_index3 = _mm256_add_epi32(m_intermediate, m_x1i);
+                    __m256i m_index4 = _mm256_add_epi32(m_intermediate, m_x2i);
+
+                    const int32_t* input = reinterpret_cast<const int32_t*>(bitmap);
+                    
+                    // Gather 32 bits of source input values from the calculated offsets
+                    // This is a bit of a waste, but the gather avx instructions are limited to 32 bits
+                    // and this is a lot quicker that storing out the offsets and loading the memory
+                    m_index1 = _mm256_i32gather_epi32(input, m_index1, 1);
+                    m_index2 = _mm256_i32gather_epi32(input, m_index2, 1);
+                    m_index3 = _mm256_i32gather_epi32(input, m_index3, 1);
+                    m_index4 = _mm256_i32gather_epi32(input, m_index4, 1);
+                    
+                    // Mask off the the rest of the 8 bit values in the 32 bit integer
+                    m_index1 = _mm256_and_si256(m_index1, mask8bit);
+                    m_index2 = _mm256_and_si256(m_index2, mask8bit);
+                    m_index3 = _mm256_and_si256(m_index3, mask8bit);
+                    m_index4 = _mm256_and_si256(m_index4, mask8bit);
+                    
+                    // Convert the source image to floating point images
+                    __m256 m_f1 = _mm256_cvtepi32_ps(m_index1);
+                    __m256 m_f2 = _mm256_cvtepi32_ps(m_index2);
+                    __m256 m_f3 = _mm256_cvtepi32_ps(m_index3);
+                    __m256 m_f4 = _mm256_cvtepi32_ps(m_index4);
+                    
+                    // Bilinear interpolation
+                    __m256 m_result = fblerp(m_f1, m_f2, m_f3, m_f4, m_dx, m_dy);
+                    m_result = _mm256_round_ps(m_result, _MM_FROUND_TO_NEAREST_INT);
+                    
+                    // Convert the result to integers and saturate it down to 8 bits
+                    m_result = _mm256_cvtps_epi32(m_result);
+                    __m128i m_low = _mm256_castsi256_si128(m_result);
+                    __m128i m_high = _mm256_extracti128_si256(m_result, 1);
+                    __m128i m_saturate = _mm_packus_epi32(m_low, m_high);
+                    
+                    // A slight waste of vector operations, but it is better
+                    // than doing a convert and shuffle using _m64
+                    m_saturate = _mm_packus_epi16(m_saturate, m_saturate);
+
+                    // Store out the result to 8 bit integer allocation
+                    __m128i* m_ptr = reinterpret_cast<__m128i*>(&output[row + l]);
+                    _mm_storel_epi64(m_ptr, m_saturate);
+                }
+            }
+        }
+    }
+}
+
 void rotate_bitmap_bilinear(const uint8_t* bitmap, const uint32_t width, const uint32_t height, const float dx, const float dy, uint8_t* output, const bool interchange) {
     const uint32_t tile_size = cacheline_size;
     const uint32_t origin_x = width >> 1;
@@ -203,12 +362,19 @@ int main(int argc, char** argv) {
     chrono::microseconds delta;
     
     if (argc < 3) {
-        cout << "Usage: ./rotate_bitmap [filename] [angle]" << endl;
+        cout << "Usage: ./rotate_bitmap filename angle [scalar]" << endl;
         return -1;
     }
 
     const char* filename = argv[1];
     float angle = fmod(stof(argv[2]), 360.f);
+
+    // if scalar is specified in the command line, then use scalar instructions
+    // insead of vectorized simd operations
+    bool vectorize = true;
+    if ((argc == 4) && (strncmp(argv[3], "scalar", 6) == 0)) {
+        vectorize = false;
+    }
 
     cout << "Rotate Bitmap " << angle << " Degrees" <<  endl;
     
@@ -256,8 +422,15 @@ int main(int argc, char** argv) {
 
         if (output != nullptr) {
             cout << "Rotating..." << endl;
+            
             chrono::high_resolution_clock::time_point start_rotate = chrono::high_resolution_clock::now();
-            rotate_bitmap_bilinear(bitmap, width, height, dx, dy, output, interchange);
+            
+            if (vectorize) {
+                rotate_bitmap_bilinear_simd(bitmap, width, height, dx, dy, output, interchange);
+            } else {
+                rotate_bitmap_bilinear(bitmap, width, height, dx, dy, output, interchange);
+            }
+
             chrono::high_resolution_clock::time_point end_rotate = chrono::high_resolution_clock::now();
 
             delta = chrono::duration_cast<chrono::microseconds>(end_rotate - start_rotate);
